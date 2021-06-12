@@ -3,6 +3,7 @@ import getpass
 import os
 import pickle
 import random
+import time
 
 from robin_stocks.robinhood.helper import *
 from robin_stocks.robinhood.urls import *
@@ -49,6 +50,71 @@ def respond_to_challenge(challenge_id, sms_code):
     }
     return(request_post(url, payload))
 
+def refresh_accessToken():
+    loginData = getSessionData()
+    if loginData == None:
+        print ("Refresh failed to fetch login data")
+        return
+
+    current_ts = time.time()
+    last_update_ts = loginData.get('update_ts')
+    if last_update_ts == None:
+        last_update_ts = 0
+
+    if current_ts - last_update_ts < 24 * 3600:
+        return
+
+    update_session("Authorization", None)
+    payload = {
+        "grant_type": "refresh_token",
+        "device_token": loginData["device_token"],
+        "refresh_token": loginData['refresh_token'],
+        "scope": "internal",
+        "client_id": 'c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBjFS',
+        "expires_in": 86400,
+    }
+
+    data = request_post(
+        login_url(),  payload)
+
+    data['device_token'] = payload['device_token']
+    print ('refreshToke result: ', data)
+    if data and 'error' not in data:
+        saveSessionData(data)
+
+    # no matter it succeeded or not, we need to reload the Authorization for pickle file
+    session_data = getSessionData()
+    update_session('Authorization', '{0} {1}'.format(
+        session_data['token_type'], session_data['access_token']))
+
+def getPicklePath():
+    home_dir = os.path.expanduser("~")
+    data_dir = os.path.join(home_dir, ".tokens")
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+    creds_file = "robinhood.pickle"
+    pickle_path = os.path.join(data_dir, creds_file)
+    return pickle_path
+
+def getSessionData():
+    pickle_path = getPicklePath()
+    try:
+        with open(pickle_path, 'rb') as f:
+            pickle_data = pickle.load(f)
+            return pickle_data
+    except Exception as e:
+        print ('Failed to get pickle file' + str(e))
+        return None
+    return None
+
+def saveSessionData(data):
+    pickle_path = getPicklePath()
+    with open(pickle_path, 'wb') as f:
+        pickle.dump({'token_type': data['token_type'],
+                     'access_token': data['access_token'],
+                     'refresh_token': data['refresh_token'],
+                     'device_token': data['device_token'],
+                     'update_ts': time.time()}, f)
 
 def login(username=None, password=None, expiresIn=86400, scope='internal', by_sms=True, store_session=True, mfa_code=None):
     """This function will effectively log the user into robinhood by getting an
@@ -77,13 +143,6 @@ def login(username=None, password=None, expiresIn=86400, scope='internal', by_sm
     contains information on whether the access token was generated or loaded from pickle file.
 
     """
-    device_token = generate_device_token()
-    home_dir = os.path.expanduser("~")
-    data_dir = os.path.join(home_dir, ".tokens")
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
-    creds_file = "robinhood.pickle"
-    pickle_path = os.path.join(data_dir, creds_file)
     # Challenge type is used if not logging in with two-factor authentication.
     if by_sms:
         challenge_type = "sms"
@@ -99,45 +158,44 @@ def login(username=None, password=None, expiresIn=86400, scope='internal', by_sm
         'scope': scope,
         'username': username,
         'challenge_type': challenge_type,
-        'device_token': device_token
+        'device_token': generate_device_token()
     }
 
     if mfa_code:
         payload['mfa_code'] = mfa_code
 
-    # If authentication has been stored in pickle file then load it. Stops login server from being pinged so much.
-    if os.path.isfile(pickle_path):
-        # If store_session has been set to false then delete the pickle file, otherwise try to load it.
-        # Loading pickle file will fail if the acess_token has expired.
-        if store_session:
-            try:
-                with open(pickle_path, 'rb') as f:
-                    pickle_data = pickle.load(f)
-                    access_token = pickle_data['access_token']
-                    token_type = pickle_data['token_type']
-                    refresh_token = pickle_data['refresh_token']
-                    # Set device_token to be the original device token when first logged in.
-                    pickle_device_token = pickle_data['device_token']
-                    payload['device_token'] = pickle_device_token
-                    # Set login status to True in order to try and get account info.
-                    set_login_state(True)
-                    update_session(
-                        'Authorization', '{0} {1}'.format(token_type, access_token))
-                    # Try to load account profile to check that authorization token is still valid.
-                    res = request_get(
-                        portfolio_profile_url(), 'regular', payload, jsonify_data=False)
-                    # Raises exception is response code is not 200.
-                    res.raise_for_status()
-                    return({'access_token': access_token, 'token_type': token_type,
-                            'expires_in': expiresIn, 'scope': scope, 'detail': 'logged in using authentication in {0}'.format(creds_file),
-                            'backup_code': None, 'refresh_token': refresh_token})
-            except:
-                print(
-                    "ERROR: There was an issue loading pickle file. Authentication may be expired - logging in normally.", file=get_output())
-                set_login_state(False)
-                update_session('Authorization', None)
-        else:
-            os.remove(pickle_path)
+    pickle_data = getSessionData()
+    if pickle_data != None:
+        try:
+            # reload session data
+            refresh_accessToken()
+            pickle_data = getSessionData()
+
+            access_token = pickle_data['access_token']
+            token_type = pickle_data['token_type']
+            # Set device_token to be the original device token when first logged in.
+            payload['device_token'] = pickle_data['device_token']
+
+            # Set login status to True in order to try and get account info.
+            set_login_state(True)
+            update_session(
+                'Authorization', '{0} {1}'.format(token_type, access_token))
+            # Try to load account profile to check that authorization token is still valid.
+
+            res = request_get(
+                portfolio_profile_url(), 'regular', payload, jsonify_data=False)
+            # Raises exception is response code is not 200.
+            print ('portfolio_profile_url', res)
+
+            res.raise_for_status()
+            return({'access_token': access_token, 'token_type': token_type,
+                    'expires_in': expiresIn, 'scope': scope
+                    })
+        except Exception as e:
+            print(
+                "ERROR: There was an issue loading pickle file. Authentication may be expired - logging in normally.", file=get_output())
+            set_login_state(False)
+            update_session('Authorization', None)
 
     # Try to log in normally.
     if not username:
@@ -178,12 +236,8 @@ def login(username=None, password=None, expiresIn=86400, scope='internal', by_sm
             update_session('Authorization', token)
             set_login_state(True)
             data['detail'] = "logged in with brand new authentication code."
-            if store_session:
-                with open(pickle_path, 'wb') as f:
-                    pickle.dump({'token_type': data['token_type'],
-                                 'access_token': data['access_token'],
-                                 'refresh_token': data['refresh_token'],
-                                 'device_token': device_token}, f)
+            data['device_token'] = payload['device_token']
+            saveSessionData(data)
         else:
             raise Exception(data['detail'])
     else:
